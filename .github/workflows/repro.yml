@@ -31,4 +31,21 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node }}
-      - run: node repro.mjs
+      - name: Run repro and write job summary
+        run: |
+          set -o pipefail
+          OUTPUT=$(node repro.mjs)
+          echo "$OUTPUT"
+          NODE_V=$(echo "$OUTPUT" | grep '^node ' | sed 's/^node //')
+          STATS=$(echo "$OUTPUT" | grep '^min=')
+          MIN=$(echo "$STATS" | sed -E 's/.*min=([0-9.]+)s.*/\1/')
+          MAX=$(echo "$STATS" | sed -E 's/.*max=([0-9.]+)s.*/\1/')
+          SPREAD=$(echo "$STATS" | sed -E 's/.*spread=([0-9.]+)x.*/\1/')
+          VERDICT="fair"
+          # fair runs are ~1.0x; treat 2x or more as the unfair-scheduling pattern
+          if awk "BEGIN{exit !($SPREAD >= 2)}"; then VERDICT="unfair"; fi
+          {
+            echo "| Node | min | max | spread | verdict |"
+            echo "|---|---|---|---|---|"
+            echo "| $NODE_V | ${MIN}s | ${MAX}s | ${SPREAD}x | $VERDICT |"
+          } >> "$GITHUB_STEP_SUMMARY"
