@@ -10,13 +10,18 @@ of simulated round-trip latency, with each stream uploading 1 MiB in 64 KiB
 chunks. It prints each stream's completion time. The script has no
 dependencies beyond `node:http2` and `node:net`.
 
+`repro-incremental.mjs` is the same script, except each request adds an
+RFC 9218 `priority: u=3, i` header (`incremental=true`) — see "Is this
+actually a bug?" below for why, and what it does (or doesn't) change.
+
 ## Running it
 
 ```sh
 node repro.mjs
+node repro-incremental.mjs
 ```
 
-Requires Node.js 18 or later. No install step — the script is
+Requires Node.js 18 or later. No install step — the scripts are
 self-contained.
 
 ## Affected versions (confirmed)
@@ -58,10 +63,64 @@ priority signaling.
 The priority tree appears to have done more than handle explicit RFC 7540
 priority signaling — it also provided an implicit fairness mechanism for
 concurrent streams when no priority is set. Removing it took that
-mechanism away without a replacement scheduling policy. (This mechanism
-explanation is our inference from the observed behavior; the changelog
-entry itself only documents the priority-signaling removal, not this
-scheduling side effect.)
+mechanism away. (This mechanism explanation is our inference from the
+observed behavior; the changelog entry itself only documents the
+priority-signaling removal, not this scheduling side effect.)
+
+## Is this actually a bug?
+
+Not clearly, on its own — see below.
+
+[RFC 9113](https://www.rfc-editor.org/rfc/rfc9113) deprecated the old
+RFC 7540 priority-tree signaling, and its intended replacement is
+[RFC 9218](https://www.rfc-editor.org/rfc/rfc9218.html) ("Extensible
+Prioritization Scheme for HTTP"), which nghttp2 also implements. RFC 9218
+defines two parameters per request: `urgency` (default `3`) and
+`incremental` (default `false`). Critically, the RFC itself recommends,
+for requests that share the same urgency and have `incremental=false`
+(i.e. anything sent with no priority hints at all, which defaults to
+`u=3, i=false`):
+
+> Serving non-incremental responses with the same urgency concurrently
+> because the client is not going to process those responses
+> incrementally. Serving non-incremental responses with the same urgency
+> one by one, in the order in which those requests were generated, is
+> considered to be the best strategy. (Section 4.2)
+
+> Non-incremental responses of the same urgency SHOULD be served by
+> prioritizing bandwidth allocation in ascending order of the stream ID,
+> which corresponds to the order in which clients make requests.
+> (Section 10.5)
+
+That is *exactly* the pattern this repro observes: 16 same-priority
+streams, served roughly one at a time in ascending stream-ID order. So
+the "unfair" scheduling matches the new spec's own documented default
+recommendation — this isn't obviously a scheduling bug in the sense of
+violating any spec.
+
+**However**, `incremental=true` is meant to be how a client opts back
+into concurrent/fair scheduling for streams it wants processed together
+(our repro's 16 uploads are exactly that case). `repro-incremental.mjs`
+tests this by sending `priority: u=3, i` (RFC 9218's syntax for
+`incremental=true`) on every request. **It has no effect** — the spread
+is unchanged (`12.6x` on Node 24.13.0, same as without the header).
+Node's `http2stream.priority()` — the old client-facing API for
+influencing scheduling — is now a deprecated no-op tied to the removed
+RFC 7540 mechanism, and there does not appear to be any current Node.js
+API that lets a client opt its own outbound streams into RFC 9218
+`incremental` scheduling for its own writes (as opposed to just hinting
+a remote server how to schedule *its* responses, which is the direction
+RFC 9218 headers are normally used for).
+
+So the more precise framing is: removing RFC 7540 priority took away a
+mechanism that also happened to provide fair default scheduling for
+concurrent client-side writes, RFC 9218's own recommended default doesn't
+restore that fairness for non-incremental same-urgency streams (which is
+what any request with no priority hints becomes), and there's currently
+no client-facing way to opt out of that default and get the old
+concurrent behavior back. That combination — not the scheduling change in
+isolation — is what looks like a gap worth raising with Node.js, framed
+as a missing capability rather than a straightforward regression.
 
 This matters for any client running several concurrent uploads or
 downloads over one HTTP/2 connection (chunked uploads, gRPC-style
